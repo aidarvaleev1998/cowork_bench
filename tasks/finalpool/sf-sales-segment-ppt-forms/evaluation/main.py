@@ -234,7 +234,6 @@ def main():
             print(f"  [CRITICAL] {e}")
         for e in all_errors:
             print(f"  [fail] {e}")
-        print("Pass: False")
         sys.exit(1)
 
     # --- Accuracy gate ---
@@ -242,13 +241,11 @@ def main():
     print(f"\nPassed {passed}/{total} checks (accuracy {accuracy:.1f}%)")
     if accuracy >= 70:
         print("=== RESULT: PASS ===")
-        print("Pass: True")
         sys.exit(0)
     else:
         print(f"=== RESULT: FAIL (accuracy {accuracy:.1f}% < 70%) ===")
         for e in all_errors:
             print(f"  {e}")
-        print("Pass: False")
         sys.exit(1)
 
 

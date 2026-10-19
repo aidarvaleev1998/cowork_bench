@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import re
+import secrets
 import shutil
 import sys
 import tarfile
@@ -38,6 +39,7 @@ from native_mcp.catalog import (  # noqa: E402
     servers_for_task,
     split_servers,
 )
+from grader_verdict_contract import analyze_source, apply_plan, is_applied  # noqa: E402
 from native_mcp.prep.db_rewrite import rewrite_preprocess_db_connections  # noqa: E402
 NATIVE_DIR = Path(__file__).resolve().parent / "native_mcp"
 PREP_SRC = NATIVE_DIR / "prep" / "prepare_workspace.py"
@@ -1271,6 +1273,59 @@ def _copy_payload(source: Path, dest: Path) -> None:
             shutil.copy2(item, target)
 
 
+def _render_pg_env(user: str, password: str, db: str) -> str:
+    """Same 13 keys, same order, as environment/generate_pg_env.sh emits."""
+    return (
+        f"POSTGRES_USER={user}\n"
+        f"POSTGRES_PASSWORD={password}\n"
+        f"POSTGRES_DB={db}\n"
+        f"PGUSER={user}\n"
+        f"PG_USER={user}\n"
+        f"PGPASSWORD={password}\n"
+        f"PG_PASSWORD={password}\n"
+        f"PGDATABASE={db}\n"
+        f"PG_DATABASE={db}\n"
+        "PGHOST=postgres\n"
+        "PG_HOST=postgres\n"
+        "PGPORT=5432\n"
+        "PG_PORT=5432\n"
+    )
+
+
+def _read_existing_pg_env(root: Path) -> dict | None:
+    """First populated environment/pg.env in a previously generated tree."""
+    for path in sorted(root.glob("*/environment/pg.env")):
+        data = {}
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                key, _, value = line.partition("=")
+                data[key.strip()] = value.strip()
+        if data.get("POSTGRES_PASSWORD"):
+            return data
+    return None
+
+
+def _resolve_pg_credentials(
+    output_root: Path, args: "argparse.Namespace"
+) -> tuple[str, str, str, str]:
+    """One credential set for the whole dataset.
+
+    Priority: --pg-password → reuse a populated pg.env already in the output
+    tree → generate a fresh random secret. Returns (user, password, db, source).
+    """
+    if args.pg_password:
+        return args.pg_user, args.pg_password, args.pg_db, "supplied"
+    existing = _read_existing_pg_env(output_root)
+    if existing:
+        return (
+            existing.get("POSTGRES_USER") or args.pg_user,
+            existing["POSTGRES_PASSWORD"],
+            existing.get("POSTGRES_DB") or args.pg_db,
+            "reused",
+        )
+    return args.pg_user, secrets.token_urlsafe(32), args.pg_db, "generated"
+
+
 def _pg_env_example() -> str:
     return (
         "# Copy to pg.env (gitignored). Do not commit real secrets.\n"
@@ -1321,7 +1376,12 @@ def _generate_pg_env_sh() -> str:
     )
 
 
-def convert_one(task: str, output_root: Path, catalog: dict) -> dict:
+def convert_one(
+    task: str,
+    output_root: Path,
+    catalog: dict,
+    pg_content: str = "",
+) -> dict:
     """Convert one Cowork task to canonical Harbor packaging."""
     source = SOURCE_TASKS / task
     if not (source / "task_config.json").is_file():
@@ -1438,9 +1498,15 @@ def convert_one(task: str, output_root: Path, catalog: dict) -> dict:
     )
 
     if has_db:
-        # Docker Compose requires env_file to exist even when it is empty.
-        # Runtime credentials are injected separately and never packaged.
-        (env_dir / "pg.env").write_bytes(b"")
+        # Docker Compose requires env_file to exist. The packaged pg.env carries
+        # the real per-dataset credentials: postgres (POSTGRES_*) seeds its user
+        # from it, prep / mcp-gateway-db / grader connect with it. The AGENT
+        # (main service) has no env_file and no mount of environment/pg.env, so
+        # the file is present in the package but invisible to the agent.
+        # Direct convert_one callers (tests) may omit credentials — the file
+        # then stays empty like the pre-patch packaging, and main() passes the
+        # resolved per-dataset content instead.
+        (env_dir / "pg.env").write_text(pg_content, encoding="utf-8")
         (env_dir / "pg.env.example").write_text(_pg_env_example(), encoding="utf-8")
         gen = env_dir / "generate_pg_env.sh"
         gen.write_text(_generate_pg_env_sh(), encoding="utf-8")
@@ -1468,6 +1534,21 @@ def convert_one(task: str, output_root: Path, catalog: dict) -> dict:
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
     )
     _rewrite_evaluation_db_secrets(target / "tests" / "evaluation")
+
+    # Verdict prints are a packaging artifact: the grader must print exactly one
+    # "Pass: True/False" line per content exit (utils/evaluation/verdict.py
+    # contract), while the finalpool sources stay in the authors' original form.
+    eval_main = target / "tests" / "evaluation" / "main.py"
+    verdict_source = eval_main.read_text(encoding="utf-8")
+    verdict_plan = analyze_source(task, eval_main, verdict_source)
+    if verdict_plan.unresolved:
+        unresolved = [s.source for s in verdict_plan.sites if s.action == "unresolved"]
+        raise ValueError(f"{task}: grader verdict contract unresolved at {unresolved}")
+    verdict_prints_inserted = not is_applied(verdict_plan, verdict_source)
+    if verdict_prints_inserted:
+        eval_main.write_text(
+            apply_plan(verdict_plan, verdict_source), encoding="utf-8"
+        )
     for dirname in ("groundtruth_workspace", "groundtruth_workspace_cn"):
         src = source / dirname
         if src.exists():
@@ -1551,6 +1632,9 @@ def convert_one(task: str, output_root: Path, catalog: dict) -> dict:
             "mcp-gateway-public",
         ],
         "workspace": SHARED_WS,
+        "grader_verdict_sites": len(verdict_plan.sites),
+        "grader_verdict_class": verdict_plan.change_class,
+        "grader_verdict_prints_inserted": verdict_prints_inserted,
         **flags,
     }
     (target / "metadata.json").write_text(
@@ -1577,6 +1661,14 @@ def main() -> int:
     parser.add_argument("--main-image", default=MAIN_IMAGE)
     parser.add_argument("--postgres-image", default=POSTGRES_IMAGE)
     parser.add_argument("--source-tasks", type=Path, default=None)
+    parser.add_argument("--pg-user", default="eigent")
+    parser.add_argument("--pg-db", default="cowork_gym")
+    parser.add_argument(
+        "--pg-password",
+        default=None,
+        help="pin one PostgreSQL password for the dataset "
+        "(default: reuse a populated pg.env in the output tree, else generate)",
+    )
     args = parser.parse_args()
     MAIN_IMAGE = args.main_image
     POSTGRES_IMAGE = args.postgres_image
@@ -1596,11 +1688,15 @@ def main() -> int:
         ids = all_task_ids()
 
     args.output.mkdir(parents=True, exist_ok=True)
+    pg_user, pg_password, pg_db, pg_source = _resolve_pg_credentials(args.output, args)
+    pg_content = _render_pg_env(pg_user, pg_password, pg_db)
+    print(f"pg.env: user={pg_user} db={pg_db} password {pg_source} ({len(pg_password)} chars)")
+
     index: list[dict] = []
     errors: list[str] = []
     for task in ids:
         try:
-            index.append(convert_one(task, args.output, catalog))
+            index.append(convert_one(task, args.output, catalog, pg_content=pg_content))
             print(f"OK {task}")
         except Exception as exc:
             errors.append(f"{task}: {exc}")

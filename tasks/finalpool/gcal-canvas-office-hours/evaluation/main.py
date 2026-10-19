@@ -496,7 +496,6 @@ def main():
                 "success": success,
             }, f, indent=2)
 
-    print("Pass: True" if (success) else "Pass: False")
     sys.exit(0 if success else 1)
 
 

@@ -13,6 +13,8 @@ from harbor_adapter.grader_verdict_contract import (
     PASS_FALSE,
     PASS_TRUE,
     analyze_task,
+    apply_plan,
+    is_applied,
     iter_task_dirs,
 )
 from utils.evaluation.evaluator import _content_outcome
@@ -70,48 +72,23 @@ def _previous_statement(lines: list[str], lineno: int) -> tuple[int, str]:
 
 class GraderVerdictStaticTests(unittest.TestCase):
     def test_all_graders_emit_one_line_per_content_path(self) -> None:
+        """Coverage + application: prints live in the PACKAGED copy, not sources.
+
+        The finalpool sources stay in the authors' original form; packaging
+        (generate_harbor_canonical.convert_one) applies the plan to
+        tests/evaluation/main.py. Here we assert the plan covers all 496
+        graders and that applying it produces exactly the planned prints.
+        """
         tasks = iter_task_dirs(TASKS)
         self.assertEqual(len(tasks), 496)
         mechanical = manual = 0
         for task_dir in tasks:
             source = (task_dir / "evaluation" / "main.py").read_text(encoding="utf-8")
-            tree = ast.parse(source)
             plan = analyze_task(task_dir)
             self.assertFalse(plan.unresolved, task_dir.name)
-            lines = source.splitlines()
-            prints = _pass_prints(source, tree)
-            self.assertTrue(all(not inside for _, _, inside in prints), task_dir.name)
-            expected: dict[int, str] = {}
-            content_sites = 0
-            for site in plan.sites:
-                line_no, previous = _previous_statement(lines, site.lineno)
-                if site.action == "pass_true":
-                    self.assertEqual(previous, PASS_TRUE, f"{task_dir.name}:{site.lineno}")
-                    expected[line_no] = PASS_TRUE
-                    content_sites += 1
-                elif site.action == "pass_false":
-                    self.assertEqual(previous, PASS_FALSE, f"{task_dir.name}:{site.lineno}")
-                    expected[line_no] = PASS_FALSE
-                    content_sites += 1
-                elif site.action == "conditional":
-                    self.assertEqual(previous, site.print_expr, f"{task_dir.name}:{site.lineno}")
-                    expected[line_no] = site.print_expr
-                    content_sites += 1
-                elif site.action == "technical":
-                    self.assertFalse(
-                        previous.startswith('print("Pass:'),
-                        f"{task_dir.name}:{site.lineno}",
-                    )
-                else:
-                    self.fail(f"unresolved {task_dir.name}")
-            if plan.implicit_pass_lineno is not None:
-                verdict_line = plan.implicit_pass_lineno + 1
-                self.assertEqual(lines[plan.implicit_pass_lineno].strip(), PASS_TRUE)
-                expected[verdict_line] = PASS_TRUE
-                content_sites += 1
-            observed = {line_no: text for line_no, text, _ in prints}
-            self.assertEqual(observed, expected, task_dir.name)
-            self.assertEqual(len(observed), content_sites, task_dir.name)
+            self.assertFalse(is_applied(plan, source), task_dir.name)
+            packaged = apply_plan(plan, source)
+            self.assertTrue(is_applied(plan, packaged), task_dir.name)
             actions = {site.action for site in plan.sites}
             self.assertTrue(
                 "pass_true" in actions or "conditional" in actions or plan.implicit_pass_lineno,

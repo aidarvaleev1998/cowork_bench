@@ -325,6 +325,61 @@ def apply_plan(plan: TaskPlan, source: str) -> str:
     return "".join(lines)
 
 
+def _norm_statement(stmt: ast.stmt) -> str:
+    try:
+        return ast.unparse(stmt)
+    except Exception:
+        return ""
+
+
+def _exit_prev_statements(source: str) -> dict[int, str]:
+    """exit lineno (1-based) -> the statement immediately before it."""
+    tree = ast.parse(source)
+    parents = _parents(tree)
+    out: dict[int, str] = {}
+    for node in ast.walk(tree):
+        if not (_is_exit(node) and node.args):
+            continue
+        statements, statement = _block_and_statement(parents, node)
+        if statements is None or statement is None:
+            out[node.lineno] = ""
+            continue
+        index = statements.index(statement)
+        previous = statements[index - 1] if index > 0 else None
+        out[node.lineno] = _norm_statement(previous) if previous is not None else ""
+    return out
+
+
+def _verdict_print_count(source: str) -> int:
+    """Number of print() calls carrying a Pass: True/False verdict."""
+    import ast as _ast
+
+    count = 0
+    for node in _ast.walk(_ast.parse(source)):
+        if isinstance(node, _ast.Call) and _call_name(node) == "print" and node.args:
+            try:
+                argument = _ast.unparse(node.args[0])
+            except Exception:
+                continue
+            if "Pass: True" in argument or "Pass: False" in argument:
+                count += 1
+    return count
+
+
+def is_applied(plan: TaskPlan, source: str) -> bool:
+    """True when the source already carries every planned verdict print.
+
+    The planned count is exact: one print per non-technical exit site, plus
+    one implicit "Pass: True" for fall-off-the-end graders. Count-based (via
+    AST, so a conditional print counts once) so generation stays idempotent
+    regardless of where earlier prints sit.
+    """
+    planned = len([s for s in plan.sites if s.action != "technical"])
+    if plan.implicit_pass_lineno is not None:
+        planned += 1
+    return _verdict_print_count(source) == planned
+
+
 def iter_task_dirs(root: Path) -> list[Path]:
     return sorted(
         path for path in root.iterdir() if (path / "evaluation" / "main.py").is_file()

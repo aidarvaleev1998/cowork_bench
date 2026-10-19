@@ -306,9 +306,7 @@ def main():
         sys.exit(1)
     if CRITICAL_FAILS:
         print(f"FAIL: провалены критичные проверки ({len(CRITICAL_FAILS)})")
-        print("Pass: False")
         sys.exit(1)
-    print("Pass: True" if (success) else "Pass: False")
     sys.exit(0 if success else 1)
 
 

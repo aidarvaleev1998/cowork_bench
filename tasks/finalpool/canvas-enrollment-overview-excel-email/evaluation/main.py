@@ -238,7 +238,6 @@ def main():
         for e in critical_failures[:10]:
             print(f"    [CRITICAL] {e}")
         print(f"  Overall: FAIL")
-        print("Pass: False")
         sys.exit(1)
 
     # Accuracy gate: structural/non-critical issues. Keep threshold >= 70%.
@@ -247,11 +246,9 @@ def main():
     print(f"  Accuracy: {accuracy:.1f}%")
     if accuracy >= 70:
         print(f"  Overall: PASS")
-        print("Pass: True")
         sys.exit(0)
     else:
         print(f"  Overall: FAIL")
-        print("Pass: False")
         sys.exit(1)
 
 

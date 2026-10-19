@@ -348,7 +348,6 @@ def main():
             pass
 
     print(f"  Overall: {'PASS' if success else 'FAIL'}")
-    print("Pass: True" if (success) else "Pass: False")
     sys.exit(0 if success else 1)
 
 

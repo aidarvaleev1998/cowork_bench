@@ -357,7 +357,6 @@ def main():
         print(f"\n=== RESULT: FAIL (critical checks failed: {len(failed_crit)}) ===")
         for label in failed_crit:
             print(f"  CRITICAL FAIL: {label}")
-        print("Pass: False")
         sys.exit(1)
 
     # --- accuracy gate (>=70%) over all granular checks ---
@@ -365,11 +364,9 @@ def main():
         print(f"\n=== RESULT: FAIL ({len(all_errors)} errors) ===")
         for e in all_errors[:10]:
             print(f"  {e}")
-        print("Pass: False")
         sys.exit(1)
     else:
         print("\n=== RESULT: PASS ===")
-        print("Pass: True")
         sys.exit(0)
 
 

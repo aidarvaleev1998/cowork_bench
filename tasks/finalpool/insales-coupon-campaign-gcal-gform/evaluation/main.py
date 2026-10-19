@@ -364,7 +364,6 @@ def main():
 
     if critical_errors:
         print(f"\n=== RESULT: FAIL (critical: {len(critical_errors)} errors) ===")
-        print("Pass: False")
         sys.exit(1)
 
     # ---- Scored checks: require accuracy >= 70 ----
@@ -380,11 +379,9 @@ def main():
 
     if accuracy >= 70:
         print("=== RESULT: PASS ===")
-        print("Pass: True")
         sys.exit(0)
     else:
         print("=== RESULT: FAIL (accuracy < 70) ===")
-        print("Pass: False")
         sys.exit(1)
 
 

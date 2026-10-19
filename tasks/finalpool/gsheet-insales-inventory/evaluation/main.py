@@ -727,7 +727,6 @@ def main():
                 print(f"  - {e}")
     if critical_failed:
         print("\nCritical semantic check(s) failed. => FAIL")
-        print("Pass: False")
         sys.exit(1)
 
     # ---- Accuracy gate (structural / soft checks), threshold >= 70 ----
@@ -757,11 +756,9 @@ def main():
 
     if accuracy >= 70:
         print("All critical checks passed and accuracy >= 70. => PASS")
-        print("Pass: True")
         sys.exit(0)
     else:
         print("Accuracy below threshold. => FAIL")
-        print("Pass: False")
         sys.exit(1)
 
 

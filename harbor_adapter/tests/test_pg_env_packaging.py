@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for zero-byte PostgreSQL env-file packaging."""
+"""Regression tests for packaged (populated) PostgreSQL env-file."""
 
 from __future__ import annotations
 
@@ -38,7 +38,9 @@ def _fingerprint(root: Path) -> str:
     digest = hashlib.sha256()
     for path in sorted(p for p in root.rglob("*") if p.is_file()):
         relative = path.relative_to(root).as_posix()
-        if relative == "STATIC_VALIDATION.json":
+        # pg.env содержит пер-датасетный пароль: две независимые генерации
+        # обязаны давать одинаковый fingerprint содержимого, кроме секрета.
+        if relative == "STATIC_VALIDATION.json" or relative.endswith("environment/pg.env"):
             continue
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
@@ -60,8 +62,8 @@ class PgEnvPackagingTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertTrue(all(f"{key}=" in text for key in aliases))
 
-    def test_validator_requires_existing_empty_file(self) -> None:
-        """The validator reports missing/non-empty files without mutation."""
+    def test_validator_requires_populated_file_with_keys(self) -> None:
+        """The validator reports missing/incomplete files without mutation."""
         with self.subTest("missing"), TemporaryDirectory() as td:
             path = Path(td) / "pg.env"
             self.assertEqual(
@@ -82,19 +84,31 @@ class PgEnvPackagingTests(unittest.TestCase):
                         "services:\n  db:\n    env_file:\n      - ./pg.env\n",
                         path,
                     ),
-                    [],
+                    ["environment/pg.env is missing POSTGRES_USER",
+                     "environment/pg.env is missing POSTGRES_PASSWORD",
+                     "environment/pg.env is missing POSTGRES_DB",
+                     "environment/pg.env is missing PGUSER",
+                     "environment/pg.env is missing PGPASSWORD",
+                     "environment/pg.env is missing PGDATABASE",
+                     "environment/pg.env is missing PGHOST",
+                     "environment/pg.env is missing PGPORT"],
                 )
 
-        with self.subTest("non-empty"):
+        with self.subTest("populated"):
             with TemporaryDirectory() as td:
                 path = Path(td) / "pg.env"
-                path.write_text("PGPASSWORD=stub\n", encoding="utf-8")
+                path.write_text(
+                    "POSTGRES_USER=eigent\nPOSTGRES_PASSWORD=s3cret\n"
+                    "POSTGRES_DB=cowork_gym\nPGUSER=eigent\nPGPASSWORD=s3cret\n"
+                    "PGDATABASE=cowork_gym\nPGHOST=postgres\nPGPORT=5432\n",
+                    encoding="utf-8",
+                )
                 self.assertEqual(
                     _validate_pg_env(
                         "services:\n  db:\n    env_file:\n      - ./pg.env\n",
                         path,
                     ),
-                    ["environment/pg.env must be zero-byte"],
+                    [],
                 )
 
     def test_validator_rejects_unreferenced_file(self) -> None:
@@ -133,13 +147,33 @@ class PgEnvPackagingTests(unittest.TestCase):
             0,
         )
 
-    def test_pg_env_is_empty_and_secret_free(self) -> None:
-        """Packaged pg.env files contain no stub values or credentials."""
+    def test_pg_env_is_populated_and_consistent(self) -> None:
+        """Packaged pg.env files are populated and identical across DB tasks."""
         root = _dataset_or_skip(self)
         files = sorted(root.glob("*/environment/pg.env"))
         self.assertEqual(len(files), 490)
-        for path in files:
-            self.assertEqual(path.read_bytes(), b"", path)
+        contents = {path.read_text(encoding="utf-8") for path in files}
+        self.assertEqual(len(contents), 1, "credential sets differ across tasks")
+        (text,) = contents
+        data = dict(
+            line.split("=", 1)
+            for line in text.splitlines()
+            if "=" in line and not line.startswith("#")
+        )
+        for key in ("POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"):
+            self.assertTrue(data.get(key), f"missing {key}")
+        self.assertNotEqual(data["POSTGRES_PASSWORD"], "camel")
+        self.assertNotIn("/workspace/tasks", text)
+
+    def test_pg_env_is_not_agent_visible(self) -> None:
+        """The agent (main) service neither env_files nor mounts pg.env."""
+        root = _dataset_or_skip(self)
+        for compose in sorted(root.glob("*/environment/docker-compose.yaml")):
+            main_block = compose.read_text(encoding="utf-8").split(
+                "\n  workspace-prep:"
+            )[0]
+            self.assertNotIn("pg.env", main_block.split("\n  mcp-gateway-db:")[0])
+            self.assertNotIn("PGPASSWORD", main_block.split("\n  mcp-gateway-db:")[0])
 
     def test_docker_compose_config_needs_no_validator_side_effect(self) -> None:
         """Compose config succeeds using packaged files only."""

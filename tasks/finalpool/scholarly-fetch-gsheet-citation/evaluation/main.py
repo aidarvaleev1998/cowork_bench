@@ -182,7 +182,6 @@ def main():
         conn.close()
         total = PASS_COUNT + FAIL_COUNT
         print(f"\nResults: {PASS_COUNT}/{total} passed, {FAIL_COUNT} failed")
-        print("Pass: False")
         sys.exit(1)
 
     ss_id = spreadsheets[0][0]
@@ -410,14 +409,12 @@ def main():
     # Any critical failure => fail regardless of accuracy.
     if has_critical_failure:
         print("FAIL: one or more CRITICAL checks failed.")
-        print("Pass: False")
         sys.exit(1)
 
     if success:
         print(f"All critical checks passed and accuracy {accuracy}% >= 70%.")
     else:
         print(f"FAIL: accuracy {accuracy}% < 70%.")
-    print("Pass: True" if (success) else "Pass: False")
     sys.exit(0 if success else 1)
 
 

@@ -320,7 +320,6 @@ def run_evaluation(agent_workspace, groundtruth_workspace, launch_time, res_log_
     if CRITICAL_FAILS:
         print(f"CRITICAL FAILURES: {CRITICAL_FAILS}")
         print(f"Passed {PASS_COUNT}/{total} checks ({accuracy:.1f}%) but critical checks failed.")
-        print("Pass: False")
         sys.exit(1)
 
     success = accuracy >= 70.0
@@ -340,7 +339,6 @@ def main():
         args.launch_time, args.res_log_file
     )
     print(message)
-    print("Pass: True" if (success) else "Pass: False")
     sys.exit(0 if success else 1)
 
 

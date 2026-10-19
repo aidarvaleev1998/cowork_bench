@@ -62,16 +62,54 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+_PG_ENV_REQUIRED = (
+    "POSTGRES_USER",
+    "POSTGRES_PASSWORD",
+    "POSTGRES_DB",
+    "PGUSER",
+    "PGPASSWORD",
+    "PGDATABASE",
+    "PGHOST",
+    "PGPORT",
+)
+
+
 def _validate_pg_env(compose: str, env_path: Path) -> list[str]:
-    """Validate the packaged env_file without creating or deleting files."""
+    """Validate the packaged env_file without creating or deleting files.
+
+    The packaged pg.env carries the real credentials (postgres seeds its user
+    from it; prep / mcp-gateway-db / grader connect with it). The agent must
+    not see it: the main service has no env_file, no PG* env and no mount of
+    environment/pg.env — enforced here against the composed main block.
+    """
     references_pg_env = bool(re.search(r"(?m)^\s*-\s+\./pg\.env\s*$", compose))
     if references_pg_env and not env_path.exists():
         return ["compose references ./pg.env but environment/pg.env is missing"]
-    if references_pg_env and env_path.stat().st_size != 0:
-        return ["environment/pg.env must be zero-byte"]
-    if not references_pg_env and env_path.exists():
-        return ["environment/pg.env exists without a compose reference"]
-    return []
+    if not references_pg_env:
+        if env_path.exists():
+            return ["environment/pg.env exists without a compose reference"]
+        return []
+    errs: list[str] = []
+    data: dict[str, str] = {}
+    for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        data[key.strip()] = value.strip()
+    for key in _PG_ENV_REQUIRED:
+        if not data.get(key):
+            errs.append(f"environment/pg.env is missing {key}")
+    # Agent-blindness: the main service block must not reference pg.env
+    # (env_file or volume) and must not carry PG credentials in its env.
+    main_match = re.search(r"(?ms)^  main:\n(.*?)(?=^  [A-Za-z_]\w*:(?:\s|$)|\Z)", compose)
+    if main_match:
+        block = main_match.group(1)
+        if "pg.env" in block:
+            errs.append("main service references pg.env — agent must not see credentials")
+        if re.search(r"(?m)^\s+(PGPASSWORD|PG_PASSWORD|POSTGRES_PASSWORD):", block):
+            errs.append("main service carries PG credentials in env")
+    return errs
 
 
 def validate_task(task_dir: Path) -> list[str]:

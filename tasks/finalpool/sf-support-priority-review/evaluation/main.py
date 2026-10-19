@@ -270,7 +270,6 @@ def main():
                        "accuracy": accuracy, "critical_failed": critical_failed,
                        "success": success}, f)
     print(f"\n=== RESULT: {'PASS' if success else 'FAIL'} ===")
-    print("Pass: True" if (success) else "Pass: False")
     sys.exit(0 if success else 1)
 
 

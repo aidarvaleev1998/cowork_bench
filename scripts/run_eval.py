@@ -41,16 +41,19 @@ async def main() -> int:
         log_file = matches[0]
 
     print(f"[run_eval] Evaluating log: {log_file}")
+    # TaskEvaluator is the single authority on the verdict: pass is True/False
+    # only after the grader's own content decision with a matching exit code,
+    # and None on any technical failure (traceback, missing log, crash).
+    # This wrapper adds nothing to the decision — it maps the outcome to an
+    # exit code and must not synthesize a Pass line.
     eval_res = await TaskEvaluator.evaluate_from_log_file(log_file)
     detail = eval_res.get("details", eval_res.get("failure", "N/A"))
-    verdict = eval_res.get("verdict")
-    passed = eval_res.get("pass")
+    outcome = eval_res.get("pass")
     grader_rc = eval_res.get("grader_rc")
-    # The grader stdout already carries the only Pass line. Do not invent one.
-    if verdict == "True" and passed is True and grader_rc == 0:
+    if outcome is True:
         print(f"Details: {detail}")
         return 0
-    if verdict == "False" and passed is False and grader_rc == 1:
+    if outcome is False:
         print(f"Details: {detail}")
         return 1
     print("evaluator technical failure")

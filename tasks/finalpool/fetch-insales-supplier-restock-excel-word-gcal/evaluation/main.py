@@ -235,7 +235,6 @@ def main():
         os.path.dirname(__file__), "..", "groundtruth_workspace")
 
     success = run_evaluation(agent_ws)
-    print("Pass: True" if (success) else "Pass: False")
     sys.exit(0 if success else 1)
 
 

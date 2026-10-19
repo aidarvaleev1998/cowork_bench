@@ -479,11 +479,9 @@ def main():
     success = run_evaluation(agent_ws, gt_dir)
     if success:
         print("\n=== RESULT: PASS ===")
-        print("Pass: True")
         sys.exit(0)
     else:
         print("\n=== RESULT: FAIL ===")
-        print("Pass: False")
         sys.exit(1)
 
 

@@ -272,7 +272,6 @@ def main():
         print(f"\n=== CRITICAL FAIL ({len(critical_errors)} critical errors) ===")
         for e in critical_errors[:10]:
             print(f"  CRITICAL: {e}")
-        print("Pass: False")
         sys.exit(1)
 
     # Accuracy gate: ~7 weighted check groups; require >= 70% with no critical fail.
@@ -290,11 +289,9 @@ def main():
 
     if accuracy >= 70:
         print("=== RESULT: PASS ===")
-        print("Pass: True")
         sys.exit(0)
     else:
         print(f"=== RESULT: FAIL (accuracy {accuracy:.1f}% < 70%) ===")
-        print("Pass: False")
         sys.exit(1)
 
 
