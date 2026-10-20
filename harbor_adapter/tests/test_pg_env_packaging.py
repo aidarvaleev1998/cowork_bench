@@ -22,6 +22,34 @@ from generate_harbor_canonical import _generate_pg_env_sh, _pg_env_example  # no
 DATASET_ROOT = os.environ.get("CANONICAL_DATASET_ROOT")
 REGEN_ROOT = os.environ.get("CANONICAL_REGEN_ROOT")
 
+# Real-shape compose: main first, then a hyphenated service carrying the
+# pg.env reference (workspace-prep). A boundary regex without hyphen support
+# would absorb workspace-prep into main and report a false leak — the exact
+# bug this fixture guards against.
+COMPOSE_DB_TASK = (
+    "services:\n"
+    "  main:\n"
+    "    image: main-image\n"
+    "    networks:\n"
+    "      - agent_net\n"
+    "  workspace-prep:\n"
+    "    env_file:\n"
+    "      - ./pg.env\n"
+    "  postgres:\n"
+    "    networks:\n"
+    "      db_net:\n"
+    "        aliases:\n"
+    "          - cowork_pg\n"
+    "  mcp-gateway-db:\n"
+    "    env_file:\n"
+    "      - ./pg.env\n"
+)
+POPULATED_PG_ENV = (
+    "POSTGRES_USER=eigent\nPOSTGRES_PASSWORD=s3cret\n"
+    "POSTGRES_DB=cowork_gym\nPGUSER=eigent\nPGPASSWORD=s3cret\n"
+    "PGDATABASE=cowork_gym\nPGHOST=postgres\nPGPORT=5432\n"
+)
+
 
 def _dataset_or_skip(test: unittest.TestCase) -> Path:
     """Return the generated dataset root configured for integration tests."""
@@ -67,10 +95,7 @@ class PgEnvPackagingTests(unittest.TestCase):
         with self.subTest("missing"), TemporaryDirectory() as td:
             path = Path(td) / "pg.env"
             self.assertEqual(
-                _validate_pg_env(
-                    "services:\n  db:\n    env_file:\n      - ./pg.env\n",
-                    path,
-                ),
+                _validate_pg_env(COMPOSE_DB_TASK, path),
                 ["compose references ./pg.env but environment/pg.env is missing"],
             )
             self.assertFalse(path.exists())
@@ -80,10 +105,7 @@ class PgEnvPackagingTests(unittest.TestCase):
                 path = Path(td) / "pg.env"
                 path.write_bytes(b"")
                 self.assertEqual(
-                    _validate_pg_env(
-                        "services:\n  db:\n    env_file:\n      - ./pg.env\n",
-                        path,
-                    ),
+                    _validate_pg_env(COMPOSE_DB_TASK, path),
                     ["environment/pg.env is missing POSTGRES_USER",
                      "environment/pg.env is missing POSTGRES_PASSWORD",
                      "environment/pg.env is missing POSTGRES_DB",
@@ -97,19 +119,41 @@ class PgEnvPackagingTests(unittest.TestCase):
         with self.subTest("populated"):
             with TemporaryDirectory() as td:
                 path = Path(td) / "pg.env"
-                path.write_text(
-                    "POSTGRES_USER=eigent\nPOSTGRES_PASSWORD=s3cret\n"
-                    "POSTGRES_DB=cowork_gym\nPGUSER=eigent\nPGPASSWORD=s3cret\n"
-                    "PGDATABASE=cowork_gym\nPGHOST=postgres\nPGPORT=5432\n",
-                    encoding="utf-8",
-                )
-                self.assertEqual(
-                    _validate_pg_env(
-                        "services:\n  db:\n    env_file:\n      - ./pg.env\n",
-                        path,
-                    ),
-                    [],
-                )
+                path.write_text(POPULATED_PG_ENV, encoding="utf-8")
+                self.assertEqual(_validate_pg_env(COMPOSE_DB_TASK, path), [])
+
+    def test_validator_main_block_stops_at_hyphenated_service(self) -> None:
+        """workspace-prep's pg.env reference is not attributed to main."""
+        with TemporaryDirectory() as td:
+            path = Path(td) / "pg.env"
+            path.write_text(POPULATED_PG_ENV, encoding="utf-8")
+            self.assertEqual(_validate_pg_env(COMPOSE_DB_TASK, path), [])
+        with TemporaryDirectory() as td:
+            path = Path(td) / "pg.env"
+            path.write_text(POPULATED_PG_ENV, encoding="utf-8")
+            leaked = COMPOSE_DB_TASK.replace(
+                "  main:\n    image: main-image\n",
+                "  main:\n    image: main-image\n    env_file:\n      - ./pg.env\n",
+            )
+            self.assertIn(
+                "main service references pg.env — agent must not see credentials",
+                _validate_pg_env(leaked, path),
+            )
+
+    def test_validator_rejects_agent_routes_to_postgres(self) -> None:
+        """A shared network with postgres is reported as a credential route."""
+        with TemporaryDirectory() as td:
+            path = Path(td) / "pg.env"
+            path.write_text(POPULATED_PG_ENV, encoding="utf-8")
+            shared = COMPOSE_DB_TASK.replace(
+                "  main:\n    image: main-image\n    networks:\n      - agent_net\n",
+                "  main:\n    image: main-image\n    networks:\n      - agent_net\n"
+                "      - db_net\n",
+            )
+            self.assertIn(
+                "main service shares network with postgres: db_net",
+                _validate_pg_env(shared, path),
+            )
 
     def test_validator_rejects_unreferenced_file(self) -> None:
         """A pg.env file is forbidden when compose does not reference it."""
@@ -122,7 +166,7 @@ class PgEnvPackagingTests(unittest.TestCase):
             )
 
     def test_pg_env_matches_compose_references(self) -> None:
-        """Every DB compose reference has one zero-byte pg.env file."""
+        """Every DB compose reference has one populated pg.env file."""
         root = _dataset_or_skip(self)
         tasks = sorted(p for p in root.iterdir() if (p / "task.toml").is_file())
         referenced = []
@@ -166,14 +210,18 @@ class PgEnvPackagingTests(unittest.TestCase):
         self.assertNotIn("/workspace/tasks", text)
 
     def test_pg_env_is_not_agent_visible(self) -> None:
-        """The agent (main) service neither env_files nor mounts pg.env."""
+        """Every packaged DB task validates: pg.env present, agent blind."""
         root = _dataset_or_skip(self)
-        for compose in sorted(root.glob("*/environment/docker-compose.yaml")):
-            main_block = compose.read_text(encoding="utf-8").split(
-                "\n  workspace-prep:"
-            )[0]
-            self.assertNotIn("pg.env", main_block.split("\n  mcp-gateway-db:")[0])
-            self.assertNotIn("PGPASSWORD", main_block.split("\n  mcp-gateway-db:")[0])
+        checked = 0
+        for task in sorted(p for p in root.iterdir() if (p / "task.toml").is_file()):
+            compose = task / "environment" / "docker-compose.yaml"
+            errs = _validate_pg_env(
+                compose.read_text(encoding="utf-8"),
+                task / "environment" / "pg.env",
+            )
+            self.assertEqual(errs, [], f"{task.name}: {errs}")
+            checked += bool((task / "environment" / "pg.env").is_file())
+        self.assertEqual(checked, 490)
 
     def test_docker_compose_config_needs_no_validator_side_effect(self) -> None:
         """Compose config succeeds using packaged files only."""

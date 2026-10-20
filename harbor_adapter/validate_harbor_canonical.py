@@ -74,13 +74,77 @@ _PG_ENV_REQUIRED = (
 )
 
 
+_SERVICE_BLOCK_RE = re.compile(r"^  ([A-Za-z_][\w.-]*):\s*$")
+
+
+def _service_blocks(compose: str) -> dict[str, str]:
+    """Split the services section into per-service YAML blocks.
+
+    Service names contain hyphens (workspace-prep, mcp-gateway-db), so a
+    \\w-only boundary regex would silently absorb them into the preceding
+    service. A boundary is a line with exactly two spaces of indentation, a
+    name and a colon; nested keys are indented four spaces or more, and
+    top-level keys (networks:, volumes:) have no indentation at all.
+    """
+    blocks: dict[str, list[str]] = {}
+    section: str | None = None
+    current: str | None = None
+    for line in compose.splitlines():
+        top = re.match(r"^([A-Za-z_][\w.-]*):", line)
+        if top:
+            section = top.group(1)
+            current = None
+            continue
+        if section != "services":
+            continue
+        boundary = _SERVICE_BLOCK_RE.match(line)
+        if boundary:
+            current = boundary.group(1)
+            blocks.setdefault(current, [])
+            continue
+        if current is not None and (line.startswith("    ") or not line.strip()):
+            blocks[current].append(line)
+    return {name: "\n".join(lines) for name, lines in blocks.items()}
+
+
+def _service_networks(block: str) -> set[str]:
+    """Collect network names from a service block (list and mapping forms)."""
+    nets: set[str] = set()
+    in_networks = False
+    for line in block.splitlines():
+        if re.match(r"^    networks:\s*$", line):
+            in_networks = True
+            continue
+        if not in_networks:
+            continue
+        item = re.match(r"^      (?:-\s+)?([A-Za-z_][\w.-]*):?(?:\s|$)", line)
+        if item:
+            nets.add(item.group(1))
+        elif line.strip():
+            in_networks = False
+    return nets
+
+
+def _pg_env_values(env_path: Path) -> dict[str, str]:
+    data: dict[str, str] = {}
+    for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        data[key.strip()] = value.strip()
+    return data
+
+
 def _validate_pg_env(compose: str, env_path: Path) -> list[str]:
     """Validate the packaged env_file without creating or deleting files.
 
-    The packaged pg.env carries the real credentials (postgres seeds its user
-    from it; prep / mcp-gateway-db / grader connect with it). The agent must
-    not see it: the main service has no env_file, no PG* env and no mount of
-    environment/pg.env — enforced here against the composed main block.
+    Valid packaged state: environment/pg.env exists, is populated (postgres
+    seeds its user from it; prep / mcp-gateway-db / grader connect with it)
+    and is referenced by compose — while the agent service (main) has no way
+    to reach the credentials from its container: no env_file or volume
+    reference, no PG credentials in env, no mount of the package root or
+    environment/, no docker socket, and no shared network with postgres.
     """
     references_pg_env = bool(re.search(r"(?m)^\s*-\s+\./pg\.env\s*$", compose))
     if references_pg_env and not env_path.exists():
@@ -90,25 +154,63 @@ def _validate_pg_env(compose: str, env_path: Path) -> list[str]:
             return ["environment/pg.env exists without a compose reference"]
         return []
     errs: list[str] = []
-    data: dict[str, str] = {}
-    for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        data[key.strip()] = value.strip()
+    data = _pg_env_values(env_path)
     for key in _PG_ENV_REQUIRED:
         if not data.get(key):
             errs.append(f"environment/pg.env is missing {key}")
-    # Agent-blindness: the main service block must not reference pg.env
-    # (env_file or volume) and must not carry PG credentials in its env.
-    main_match = re.search(r"(?ms)^  main:\n(.*?)(?=^  [A-Za-z_]\w*:(?:\s|$)|\Z)", compose)
-    if main_match:
-        block = main_match.group(1)
-        if "pg.env" in block:
-            errs.append("main service references pg.env — agent must not see credentials")
-        if re.search(r"(?m)^\s+(PGPASSWORD|PG_PASSWORD|POSTGRES_PASSWORD):", block):
-            errs.append("main service carries PG credentials in env")
+    blocks = _service_blocks(compose)
+    main = blocks.get("main")
+    if main is None:
+        errs.append("compose has no main service — agent blindness cannot be verified")
+        return errs
+    # Agent-blindness: the main container must have no path to the secret.
+    if "pg.env" in main:
+        errs.append("main service references pg.env — agent must not see credentials")
+    if re.search(r"(?m)^\s+(PGPASSWORD|PG_PASSWORD|POSTGRES_PASSWORD):", main):
+        errs.append("main service carries PG credentials in env")
+    for volume in re.findall(r"(?m)^\s+-\s+(\.[^:\s]*):", main):
+        if volume.rstrip("/") in (".", "./environment"):
+            errs.append(f"main service mounts {volume} — would expose environment/pg.env")
+    if "docker.sock" in main:
+        errs.append("main service mounts docker.sock — agent could read postgres credentials")
+    postgres = blocks.get("postgres")
+    if postgres is not None:
+        shared = sorted(_service_networks(main) & _service_networks(postgres))
+        if shared:
+            errs.append("main service shares network with postgres: " + ", ".join(shared))
+    return errs
+
+
+def _validate_agent_blindness(task_dir: Path) -> list[str]:
+    """Scan agent-visible surfaces for the packaged password value.
+
+    Compose-level blindness is checked by _validate_pg_env; this complements
+    it on the files the agent receives directly: task.toml (MCP URLs and env),
+    the public MCP manifest, the workspace-prep script, the instruction and
+    the task payload that main unpacks at runtime.
+    """
+    pg_env = task_dir / "environment" / "pg.env"
+    if not pg_env.is_file():
+        return []
+    password = _pg_env_values(pg_env).get("POSTGRES_PASSWORD", "")
+    if not password:
+        return []
+    errs: list[str] = []
+    surfaces = [
+        "task.toml",
+        "instruction.md",
+        "environment/mcp_manifest_public.json",
+        "environment/prep/prepare_workspace.py",
+    ]
+    for rel in surfaces:
+        path = task_dir / rel
+        if path.is_file() and password in path.read_text(encoding="utf-8", errors="replace"):
+            errs.append(f"{rel} contains the pg password — agent-visible")
+    payload = task_dir / "environment" / "task_payload"
+    if payload.is_dir():
+        for path in sorted(payload.rglob("*")):
+            if path.is_file() and password.encode("utf-8") in path.read_bytes():
+                errs.append(f"environment/task_payload/{path.name} contains the pg password")
     return errs
 
 
@@ -270,13 +372,15 @@ def validate_task(task_dir: Path) -> list[str]:
             errs.append("NO_GROUNDTRUTH marker on GT task")
 
     # Docker Compose requires every referenced env_file to exist. The
-    # packaged pg.env is intentionally zero-byte; runtime credentials are
-    # injected outside the dataset.
+    # packaged pg.env carries the per-dataset credentials: populated in the
+    # dataset is the valid state, provided the agent container stays blind
+    # to it (checked in _validate_pg_env and _validate_agent_blindness).
     compose_path = task_dir / "environment" / "docker-compose.yaml"
     if compose_path.exists():
         env_dir = task_dir / "environment"
         pg_env = env_dir / "pg.env"
         errs.extend(_validate_pg_env(compose, pg_env))
+        errs.extend(_validate_agent_blindness(task_dir))
         try:
             subprocess.run(
                 ["docker", "compose", "-f", str(compose_path), "config", "-q"],
