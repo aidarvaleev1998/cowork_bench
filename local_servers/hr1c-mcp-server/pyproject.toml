@@ -3,7 +3,7 @@ name = "hr1c_mcp_server"
 version = "0.1.0"
 description = "1С:ЗУП-подобный HR MCP-сервер (российская HR-БД поверх PostgreSQL)"
 readme = "README.md"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "mcp>=1.0.0",
     "pandas>=2.2.3",

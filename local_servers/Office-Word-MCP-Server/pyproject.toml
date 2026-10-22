@@ -110,7 +110,6 @@ constraint-dependencies = [
     "referencing==0.37.0",
     "rich-rst==1.3.2",
     "rich==14.0.0",
-    "rpds-py==0.30.0",
     "secretstorage==3.5.0",
     "sniffio==1.3.1",
     "sse-starlette==2.3.3",

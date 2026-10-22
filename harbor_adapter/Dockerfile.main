@@ -9,7 +9,8 @@ RUN /opt/local_servers/playwright-mcp/node_modules/.bin/playwright install chrom
 
 # LiteLLM 1.92 imports its proxy MCP chat handler for tool-enabled requests but
 # the base install omits that handler's runtime dependencies.
-RUN uv pip install --python /opt/venv/bin/python 'litellm[proxy]==1.92.0'
+RUN uv pip install --python /opt/venv/bin/python \
+    -c /tmp/constraints-opt-venv.txt 'litellm[proxy]==1.92.0'
 
 # CLI agents are preinstalled because evaluation containers cannot rely on
 # GitHub/nvm/package downloads during agent setup. Node 22 is already provided
