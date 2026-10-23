@@ -12,6 +12,7 @@ from pathlib import Path
 from harbor_adapter.grader_verdict_contract import (
     PASS_FALSE,
     PASS_TRUE,
+    analyze_source,
     analyze_task,
     apply_plan,
     is_applied,
@@ -131,6 +132,69 @@ class StrictParserTests(unittest.TestCase):
         self.assertIsNone(conflict["pass"])
         mismatch = _content_outcome("Pass: True\n", "", 1)
         self.assertIsNone(mismatch["pass"])
+
+
+class AgentOutputPathCheckTests(unittest.TestCase):
+    """A missing agent deliverable is the agent's failure: Pass: False.
+
+    A missing groundtruth and a missing workspace directory are not the
+    agent's failure: those exits stay technical. Without the distinction
+    every agent-fail turn became "missing verdict" → technical → three
+    wasted retries per task.
+    """
+
+    SOURCE = (
+        "import os\n"
+        "import sys\n"
+        "\n"
+        "\n"
+        "def main(args, gt_dir):\n"
+        '    agent_file = os.path.join(args.agent_workspace, "Report.xlsx")\n'
+        '    gt_file = os.path.join(gt_dir, "Report.xlsx")\n'
+        "    if not os.path.exists(agent_file):\n"
+        '        print(f"FAIL: Agent output not found: {agent_file}")\n'
+        "        sys.exit(1)\n"
+        "    if not os.path.exists(gt_file):\n"
+        '        print(f"FAIL: Groundtruth not found: {gt_file}")\n'
+        "        sys.exit(1)\n"
+        "    if not os.path.isdir(args.agent_workspace):\n"
+        '        print("FAIL: workspace missing")\n'
+        "        sys.exit(1)\n"
+        "    if accuracy < 70.0:\n"
+        "        sys.exit(1)\n"
+        "    sys.exit(0)\n"
+    )
+
+    def test_agent_output_exit_is_content_fail(self) -> None:
+        plan = analyze_source("demo", Path("demo/evaluation/main.py"), self.SOURCE)
+        self.assertFalse(plan.unresolved)
+        agent = next(s for s in plan.sites if s.source == "path_check_agent_output")
+        self.assertEqual(agent.action, "pass_false")
+        self.assertFalse(agent.manual)
+        gt = next(s for s in plan.sites if "exists(gt_file)" in s.source)
+        self.assertEqual(gt.action, "technical")
+        workspace = next(s for s in plan.sites if "isdir" in s.source)
+        self.assertEqual(workspace.action, "technical")
+
+    def test_groundtruth_only_graders_stay_technical(self) -> None:
+        source = self.SOURCE.replace(
+            '    if not os.path.exists(agent_file):\n'
+            '        print(f"FAIL: Agent output not found: {agent_file}")\n'
+            "        sys.exit(1)\n",
+            "",
+        )
+        plan = analyze_source("demo", Path("demo/evaluation/main.py"), source)
+        self.assertFalse(any(s.action == "pass_false" and s.source == "path_check_agent_output" for s in plan.sites))
+
+    def test_packaged_print_lands_before_agent_exit(self) -> None:
+        plan = analyze_source("demo", Path("demo/evaluation/main.py"), self.SOURCE)
+        packaged = apply_plan(plan, self.SOURCE)
+        self.assertTrue(is_applied(plan, packaged))
+        lines = packaged.splitlines()
+        fail_at = next(i for i, line in enumerate(lines) if "Agent output not found" in line)
+        self.assertIn(PASS_FALSE, lines[fail_at + 1])
+        gt_at = next(i for i, line in enumerate(lines) if "Groundtruth not found" in line)
+        self.assertNotIn("Pass:", lines[gt_at + 1])
 
 
 if __name__ == "__main__":

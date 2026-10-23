@@ -223,6 +223,65 @@ def _rewrite_evaluation_db_secrets(evaluation_dir: Path) -> None:
             py.write_text(updated, encoding="utf-8")
 
 
+_SHIM_RE = re.compile(r"sys\.path\.insert\(\s*0\s*,[^)]*__file__")
+
+
+def _first_flat_sibling_import(main_py: Path) -> int | None:
+    """Lineno of the first module-level flat import of a sibling module.
+
+    Relative (dotted) imports are fine under the canonical ``-m`` invocation
+    and are skipped. Returns None when the grader already carries the
+    authors' sys.path shim or imports no sibling flat.
+    """
+    siblings = {p.stem for p in main_py.parent.glob("*.py")}
+    siblings -= {main_py.stem, "__init__"}
+    if not siblings:
+        return None
+    source = main_py.read_text(encoding="utf-8", errors="replace")
+    if _SHIM_RE.search(source):
+        return None
+    import ast  # noqa: PLC0415 — нужен только при наличии сиблингов
+
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Import):
+            names = [alias.name.split(".")[0] for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                continue
+            names = [node.module.split(".")[0]] if node.module else []
+        else:
+            continue
+        if any(name in siblings for name in names):
+            return node.lineno
+    return None
+
+
+def _ensure_sibling_import_shim(main_py: Path) -> bool:
+    """Make flat sibling imports resolvable under ``python -m`` and as a script.
+
+    Grading runs ``python -m tasks.finalpool.<task>.evaluation.main`` from
+    /workspace, so the grader's own directory is never on sys.path; the
+    oracle branch runs the same file as a plain script. Upstream carried two
+    author idioms — relative imports (only -m) and flat imports with a
+    sys.path shim (both modes). The harbor port flattened two relative
+    graders without the shim, so ``from check_local import ...`` broke the
+    -m path. Insert the authors' shim into the packaged copy only.
+    """
+    lineno = _first_flat_sibling_import(main_py)
+    if lineno is None:
+        return False
+    lines = main_py.read_text(encoding="utf-8").splitlines(keepends=True)
+    first = lines[lineno - 1]
+    pad = first[: len(first) - len(first.lstrip(" "))]
+    shim = (
+        f"{pad}import os, sys\n"
+        f"{pad}sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\n"
+    )
+    lines.insert(lineno - 1, shim)
+    main_py.write_text("".join(lines), encoding="utf-8")
+    return True
+
+
 def _preprocess_needs_pg(source: Path) -> bool:
     prep = source / "preprocess" / "main.py"
     if not prep.is_file():
@@ -284,7 +343,10 @@ def _task_toml(task: str, servers: list[dict], *, has_db: bool) -> str:
             docker_image = "{MAIN_IMAGE}"
             network_mode = "public"
             build_timeout_sec = 1800.0
-            workdir = "/workspace"
+            # The agent starts inside the shared workspace: the instruction
+            # names it (WORKSPACE_HINT) and graders read deliverables from
+            # there, so cwd and prompt must not disagree.
+            workdir = "/workspace/cowork_shared"
             cpus = 4
             memory_mb = 12288
             storage_mb = 20480
@@ -942,6 +1004,13 @@ def _verifier(task: str, *, has_db: bool) -> str:
               if [ -d /tests/groundtruth_workspace_cn ]; then
                 cp -a /tests/groundtruth_workspace_cn "$ROOT/groundtruth_workspace_cn"
               fi
+              # The agent image strips /workspace/tasks (isolation), so the
+              # rest of the task tree the graders read — files/, tmp/,
+              # initial_workspace/ — is reconstructed here just like
+              # evaluation/ and groundtruth, from the verifier-only /tests.
+              if [ -d /tests/task_data ]; then
+                cp -a /tests/task_data/. "$ROOT/"
+              fi
 
               ORACLE_WORKSPACE=/logs/artifacts/cowork/oracle_workspace
               if [ -f "$ORACLE_WORKSPACE/.oracle-ready" ]; then
@@ -1088,6 +1157,13 @@ PY
         fi
         if [ -d /tests/groundtruth_workspace_cn ]; then
           cp -a /tests/groundtruth_workspace_cn "$ROOT/groundtruth_workspace_cn"
+        fi
+        # The agent image strips /workspace/tasks (isolation), so the rest of
+        # the task tree the graders read — files/, tmp/, initial_workspace/ —
+        # is reconstructed here just like evaluation/ and groundtruth, from
+        # the verifier-only /tests.
+        if [ -d /tests/task_data ]; then
+          cp -a /tests/task_data/. "$ROOT/"
         fi
 
         ORACLE_WORKSPACE=/logs/artifacts/cowork/oracle_workspace
@@ -1534,6 +1610,9 @@ def convert_one(
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
     )
     _rewrite_evaluation_db_secrets(target / "tests" / "evaluation")
+    grader_import_shim = _ensure_sibling_import_shim(
+        target / "tests" / "evaluation" / "main.py"
+    )
 
     # Verdict prints are a packaging artifact: the grader must print exactly one
     # "Pass: True/False" line per content exit (utils/evaluation/verdict.py
@@ -1557,6 +1636,22 @@ def convert_one(
                 target / "tests" / dirname,
                 ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
             )
+    # Grader-side task data (files/, tmp/, initial_workspace/): graders open
+    # these from $ROOT at verifier time, but the agent image strips
+    # /workspace/tasks (isolation) and test.sh reconstructs only evaluation/
+    # and groundtruth. Ship the data under tests/ so it rides the same
+    # verifier-only mount in both grading paths (db sidecar /tests, no-db
+    # main staging) and stays invisible to the agent.
+    grader_task_data: list[str] = []
+    for name in ("files", "tmp", "initial_workspace"):
+        src = source / name
+        if src.is_dir():
+            shutil.copytree(
+                src,
+                target / "tests" / "task_data" / name,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+            grader_task_data.append(name)
     for name in ("workspace_lifecycle.py", "completion.py"):
         shutil.copy2(NATIVE_DIR / name, env_dir / "lifecycle" / name)
         shutil.copy2(NATIVE_DIR / name, target / "tests" / "verifier" / name)
@@ -1632,6 +1727,8 @@ def convert_one(
             "mcp-gateway-public",
         ],
         "workspace": SHARED_WS,
+        "grader_task_data": grader_task_data,
+        "grader_import_shim": grader_import_shim,
         "grader_verdict_sites": len(verdict_plan.sites),
         "grader_verdict_class": verdict_plan.change_class,
         "grader_verdict_prints_inserted": verdict_prints_inserted,

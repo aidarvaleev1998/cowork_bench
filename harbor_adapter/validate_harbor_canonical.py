@@ -302,6 +302,17 @@ def validate_task(task_dir: Path) -> list[str]:
     script = (task_dir / "tests" / "test.sh").read_text(encoding="utf-8") if (task_dir / "tests" / "test.sh").exists() else ""
     if "--contract " not in script or "/tests/grader_private/task_contract.json" not in script:
         errs.append("verifier does not read the grader-only contract")
+    # Graders with flat sibling imports must carry the sys.path shim: the -m
+    # grading path never puts the grader's own directory on sys.path.
+    packaged_main = task_dir / "tests" / "evaluation" / "main.py"
+    if packaged_main.is_file():
+        here = str(Path(__file__).resolve().parent)
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        from generate_harbor_canonical import _first_flat_sibling_import
+
+        if _first_flat_sibling_import(packaged_main) is not None:
+            errs.append("flat sibling imports without sys.path shim")
     for service in (
         "main",
         "workspace-prep",
@@ -342,6 +353,8 @@ def validate_task(task_dir: Path) -> list[str]:
             continue  # source copies may still contain historical literals until prep rewrite
         if rel.startswith("tests/evaluation/") or rel.startswith("tests/groundtruth"):
             continue
+        if rel.startswith("tests/task_data/"):
+            continue  # source data copies (mock pages, initial workspace) — same rationale as task_payload
         if rel.startswith("solution/groundtruth_workspace/"):
             continue
         try:

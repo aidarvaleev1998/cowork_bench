@@ -1,8 +1,12 @@
 """Control-flow contract for the grader's own Pass line.
 
 The wrapper does not invent a verdict. Each grader prints ``Pass: True`` or
-``Pass: False`` only after its existing content decision. Exception handlers,
-missing inputs, missing groundtruth, and exits before that decision print nothing.
+``Pass: False`` only after its existing content decision. One pre-decision
+exit IS a content decision: when the checked path is the agent's own output
+(the deliverable was never produced), the grader prints ``Pass: False`` —
+that is the agent's failure, not a technical condition. Exception handlers,
+missing groundtruth, grader-side inputs, and other exits before that
+decision print nothing.
 
 This module classifies ``sys.exit`` sites. It does not change thresholds,
 check order, or calculations.
@@ -147,6 +151,51 @@ def _is_path_check(test: ast.AST) -> bool:
     return False
 
 
+# A missing path is the agent's failure only when the checked file belongs to
+# the agent's workspace — the deliverable was never produced. Groundtruth and
+# other grader-side paths stay technical: their absence is not the agent's
+# fault, and grading over them would lie.
+AGENT_PATH_RE = re.compile(
+    r"agent[_ ]?(file|path|dir|workspace)|args\.agent_workspace|agent_workspace|Agent output",
+    re.I,
+)
+GRADER_PATH_RE = re.compile(
+    r"gt[_ ]?(file|path|dir)|groundtruth|args\.groundtruth_workspace",
+    re.I,
+)
+
+
+def _path_check_is_agent_output(
+    parents: dict[ast.AST, ast.AST], node: ast.AST, test_text: str
+) -> bool:
+    """True when a path-check exit guards the agent's own deliverable.
+
+    Looks at the if-test and the statements printed just before the exit
+    (typically ``print(f"FAIL: Agent output not found: {agent_file}")``).
+    A bare workspace-directory check is NOT a deliverable check: a missing
+    workspace is an environment condition, so it stays technical. Groundtruth
+    evidence wins over agent evidence; unknown paths stay technical via the
+    caller.
+    """
+    for call in ast.walk(ast.parse(test_text)):
+        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                and call.func.attr in {"exists", "isfile", "isdir"}):
+            continue
+        for arg in call.args:
+            compact = ast.unparse(arg).replace(" ", "")
+            if compact in {"agent_workspace", "args.agent_workspace", "workspace"}:
+                return False
+    blob = test_text
+    statements, statement = _block_and_statement(parents, node)
+    if statements is not None and statement is not None:
+        index = statements.index(statement)
+        for earlier in statements[max(0, index - 2) : index]:
+            blob += "\n" + ast.unparse(earlier)
+    if GRADER_PATH_RE.search(blob):
+        return False
+    return bool(AGENT_PATH_RE.search(blob))
+
+
 def _is_zero_checks(test: ast.AST) -> bool:
     text = ast.unparse(test)
     if text.strip() in {"total == 0", "total_checks == 0", "not results", "not checks"}:
@@ -259,10 +308,23 @@ def analyze_source(task: str, path: Path, source: str) -> TaskPlan:
                 )
             continue
         test_text = ast.unparse(nearest.test)
-        if test_text in MANUAL_TECHNICAL_TESTS or _is_path_check(nearest.test) or _is_zero_checks(nearest.test):
-            manual = test_text in MANUAL_TECHNICAL_TESTS
+        if test_text in MANUAL_TECHNICAL_TESTS:
+            # Curated technical list wins over every heuristic below.
             plan.sites.append(
-                ExitSite(node.lineno, "technical", test_text, manual, argument)
+                ExitSite(node.lineno, "technical", test_text, True, argument)
+            )
+            continue
+        if _is_path_check(nearest.test) and _path_check_is_agent_output(parents, node, test_text):
+            # The deliverable was never produced: an honest content fail, not
+            # a technical condition. Without this branch every agent-fail
+            # turn became "missing verdict" → technical → 3 wasted retries.
+            plan.sites.append(
+                ExitSite(node.lineno, "pass_false", "path_check_agent_output", False, argument)
+            )
+            continue
+        if _is_path_check(nearest.test) or _is_zero_checks(nearest.test):
+            plan.sites.append(
+                ExitSite(node.lineno, "technical", test_text, False, argument)
             )
             continue
         if test_text in MANUAL_CONTENT_TESTS or CONTENT_NAME.search(test_text):
